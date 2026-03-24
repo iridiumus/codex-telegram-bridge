@@ -1,0 +1,25 @@
+services:
+  telegram-bridge:
+    build:
+      context: .
+    init: true
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=256m
+    environment:
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
+      CHAT_ID: ${CHAT_ID:-}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DOWNLOAD_DIR: /tmp/telegram-mcp
+      ALLOWED_FILE_ROOTS: /workspace
+    volumes:
+      - type: bind
+        source: ${WORKSPACE_BIND:-.}
+        target: /workspace
+        read_only: true
+    command: ["node", "build/index.js"]

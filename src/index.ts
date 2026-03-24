@@ -6,12 +6,16 @@ import TelegramBot from "node-telegram-bot-api";
 import { z } from "zod";
 import * as fs from "fs";
 import * as path from "path";
-import { execSync } from "child_process";
+import { spawnSync } from "child_process";
 
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const CHAT_ID = process.env.CHAT_ID;
 const DOWNLOAD_DIR = process.env.DOWNLOAD_DIR || "/tmp/telegram-mcp";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+const EXTRA_ALLOWED_FILE_ROOTS = (process.env.ALLOWED_FILE_ROOTS || "")
+  .split(",")
+  .map((root) => root.trim())
+  .filter(Boolean);
 
 if (!TELEGRAM_TOKEN || !CHAT_ID) {
   console.error("TELEGRAM_TOKEN and CHAT_ID env vars required");
@@ -21,8 +25,22 @@ if (!TELEGRAM_TOKEN || !CHAT_ID) {
 const chatId = CHAT_ID;
 
 if (!fs.existsSync(DOWNLOAD_DIR)) {
-  fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
+  fs.mkdirSync(DOWNLOAD_DIR, { recursive: true, mode: 0o700 });
 }
+
+const WORKSPACE_ROOT = fs.realpathSync.native(process.cwd());
+const DOWNLOAD_ROOT = fs.realpathSync.native(DOWNLOAD_DIR);
+const SAFE_READ_ROOTS = Array.from(new Set([
+  WORKSPACE_ROOT,
+  DOWNLOAD_ROOT,
+  ...EXTRA_ALLOWED_FILE_ROOTS.map((root) => {
+    try {
+      return fs.realpathSync.native(root);
+    } catch {
+      return path.resolve(root);
+    }
+  }),
+]));
 
 // --- Types ---
 
@@ -60,23 +78,34 @@ bot.on("polling_error", () => {});
 
 async function downloadFile(fileId: string, suggestedName?: string): Promise<{ localPath: string; fileName: string }> {
   const file = await bot.getFile(fileId);
-  const filePath = file.file_path!;
+  const filePath = file.file_path;
+  if (!filePath) throw new Error(`Telegram did not return a file path for ${fileId}`);
   const ext = path.extname(filePath) || "";
-  const fileName = suggestedName || `${fileId}${ext}`;
-  const localPath = path.join(DOWNLOAD_DIR, fileName);
+  const safeName = sanitizeDownloadFileName(suggestedName || `${fileId}${ext}`);
+  const fileName = `${Date.now()}_${safeName}`;
+  const localPath = path.join(DOWNLOAD_ROOT, fileName);
   const url = `https://api.telegram.org/file/bot${TELEGRAM_TOKEN}/${filePath}`;
   const response = await fetch(url);
+  if (!response.ok) throw new Error(`Telegram download failed with HTTP ${response.status}`);
   const buffer = Buffer.from(await response.arrayBuffer());
-  fs.writeFileSync(localPath, buffer);
+  fs.writeFileSync(localPath, buffer, { mode: 0o600 });
   return { localPath, fileName };
 }
 
 function cleanupFile(filePath: string) {
-  try { if (fs.existsSync(filePath)) fs.unlinkSync(filePath); } catch {}
+  try {
+    const resolvedPath = path.resolve(filePath);
+    if (isWithinRoot(resolvedPath, DOWNLOAD_ROOT) && fs.existsSync(resolvedPath)) fs.unlinkSync(resolvedPath);
+  } catch {}
 }
 
 function cleanupDir(dirPath: string) {
-  try { if (fs.existsSync(dirPath)) fs.rmSync(dirPath, { recursive: true }); } catch {}
+  try {
+    const resolvedPath = path.resolve(dirPath);
+    if (isWithinRoot(resolvedPath, DOWNLOAD_ROOT) && fs.existsSync(resolvedPath)) {
+      fs.rmSync(resolvedPath, { recursive: true, force: true });
+    }
+  } catch {}
 }
 
 function escapeHtml(text: string): string {
@@ -92,6 +121,61 @@ function formatForTelegram(text: string): string {
   formatted = formatted.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
   formatted = formatted.replace(/(?<![<\/\w])\*([^*]+)\*(?![>])/g, "<i>$1</i>");
   return formatted;
+}
+
+function sanitizeDownloadFileName(fileName: string): string {
+  const baseName = fileName.split(/[\\/]/).pop() || "file";
+  const sanitized = baseName
+    .replace(/[\u0000-\u001f<>:"|?*]+/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/^\.+/, "")
+    .slice(0, 120);
+  return sanitized || "file";
+}
+
+function isWithinRoot(targetPath: string, rootPath: string): boolean {
+  const relativePath = path.relative(rootPath, targetPath);
+  return relativePath === "" || (!relativePath.startsWith("..") && !path.isAbsolute(relativePath));
+}
+
+function ensureAbsoluteExistingFile(filePath: string): string {
+  if (!path.isAbsolute(filePath)) throw new Error("File path must be absolute.");
+  if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
+  const resolvedPath = fs.realpathSync.native(filePath);
+  if (!fs.statSync(resolvedPath).isFile()) throw new Error(`Not a file: ${resolvedPath}`);
+  return resolvedPath;
+}
+
+function ensureReadableFilePath(filePath: string): string {
+  const resolvedPath = ensureAbsoluteExistingFile(filePath);
+  if (!SAFE_READ_ROOTS.some((rootPath) => isWithinRoot(resolvedPath, rootPath))) {
+    throw new Error(`File path must be inside one of: ${SAFE_READ_ROOTS.join(", ")}`);
+  }
+  return resolvedPath;
+}
+
+function ensureManagedDownloadFilePath(filePath: string): string {
+  const resolvedPath = ensureAbsoluteExistingFile(filePath);
+  if (!isWithinRoot(resolvedPath, DOWNLOAD_ROOT)) {
+    throw new Error(`File path must be inside managed download directory: ${DOWNLOAD_ROOT}`);
+  }
+  return resolvedPath;
+}
+
+function runCommand(command: string, args: string[], timeout: number): string {
+  const result = spawnSync(command, args, {
+    encoding: "utf8",
+    timeout,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  if (result.error) throw result.error;
+  if (result.status !== 0) {
+    const stderr = (result.stderr || "").trim();
+    throw new Error(stderr || `${command} exited with code ${result.status}`);
+  }
+
+  return result.stdout || "";
 }
 
 const IMAGE_EXTS = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"];
@@ -345,26 +429,27 @@ server.tool(
     caption: z.string().optional().describe("Optional caption"),
   },
   async ({ filePath, caption }) => {
-    const ext = path.extname(filePath).toLowerCase();
+    const safeFilePath = ensureReadableFilePath(filePath);
+    const ext = path.extname(safeFilePath).toLowerCase();
 
     // Handle confusing extensions (.ts = TypeScript but Telegram thinks MPEG Transport Stream)
     if (CONFUSING_EXTS.includes(ext)) {
-      const safePath = filePath.replace(/\.ts$/, ".txt");
-      const tmpPath = path.join(DOWNLOAD_DIR, path.basename(safePath));
-      fs.copyFileSync(filePath, tmpPath);
-      await bot.sendDocument(chatId, tmpPath, { caption: caption ? `${caption} (renamed .ts → .txt)` : `${path.basename(filePath)} (renamed .ts → .txt)` });
+      const safeName = sanitizeDownloadFileName(path.basename(safeFilePath).replace(/\.ts$/i, ".txt"));
+      const tmpPath = path.join(DOWNLOAD_ROOT, `${Date.now()}_${safeName}`);
+      fs.copyFileSync(safeFilePath, tmpPath);
+      await bot.sendDocument(chatId, tmpPath, { caption: caption ? `${caption} (renamed .ts → .txt)` : `${path.basename(safeFilePath)} (renamed .ts → .txt)` });
       cleanupFile(tmpPath);
-      return { content: [{ type: "text", text: `File sent: ${filePath} (as .txt)` }] };
+      return { content: [{ type: "text", text: `File sent: ${safeFilePath} (as .txt)` }] };
     }
 
     if (IMAGE_EXTS.includes(ext)) {
-      await bot.sendPhoto(chatId, filePath, { caption });
+      await bot.sendPhoto(chatId, safeFilePath, { caption });
     } else if (VIDEO_EXTS.includes(ext)) {
-      await bot.sendVideo(chatId, filePath, { caption });
+      await bot.sendVideo(chatId, safeFilePath, { caption });
     } else {
-      await bot.sendDocument(chatId, filePath, { caption });
+      await bot.sendDocument(chatId, safeFilePath, { caption });
     }
-    return { content: [{ type: "text", text: `File sent: ${filePath}` }] };
+    return { content: [{ type: "text", text: `File sent: ${safeFilePath}` }] };
   }
 );
 
@@ -392,23 +477,27 @@ async function transcribeAudio(audioPath: string): Promise<string> {
 // TOOL: transcribe_audio
 server.tool(
   "transcribe_audio",
-  "Transcribe an audio or voice file using OpenAI Whisper. Returns the transcribed text. Auto-cleans up the file after processing.",
-  { filePath: z.string().describe("Absolute path to the audio file (ogg, mp3, m4a, wav, etc.)") },
+  "Transcribe an audio or voice file previously downloaded by this bridge using OpenAI Whisper. Returns the transcribed text. Auto-cleans up the file after processing.",
+  { filePath: z.string().describe("Absolute path to a bridge-managed audio file inside DOWNLOAD_DIR (ogg, mp3, m4a, wav, etc.)") },
   async ({ filePath }) => {
-    if (!fs.existsSync(filePath)) return { content: [{ type: "text", text: `Error: File not found: ${filePath}` }] };
+    let sourcePath: string | null = null;
+    let convertedPath: string | null = null;
+
     try {
-      let audioPath = filePath;
-      if (filePath.endsWith(".ogg") || filePath.endsWith(".oga")) {
-        audioPath = filePath.replace(/\.[^.]+$/, ".mp3");
-        execSync(`ffmpeg -y -i "${filePath}" -acodec libmp3lame -q:a 2 "${audioPath}"`, { timeout: 60000, stdio: "pipe" });
+      sourcePath = ensureManagedDownloadFilePath(filePath);
+      let audioPath = sourcePath;
+      if (sourcePath.endsWith(".ogg") || sourcePath.endsWith(".oga")) {
+        convertedPath = sourcePath.replace(/\.[^.]+$/, ".mp3");
+        runCommand("ffmpeg", ["-y", "-i", sourcePath, "-acodec", "libmp3lame", "-q:a", "2", convertedPath], 60000);
+        audioPath = convertedPath;
       }
       const transcript = await transcribeAudio(audioPath);
-      // Auto-cleanup
-      if (audioPath !== filePath) cleanupFile(audioPath);
-      cleanupFile(filePath);
-      return { content: [{ type: "text", text: JSON.stringify({ transcript, sourceFile: filePath }) }] };
+      return { content: [{ type: "text", text: JSON.stringify({ transcript, sourceFile: sourcePath }) }] };
     } catch (err: any) {
       return { content: [{ type: "text", text: `Transcription error: ${err.message}` }] };
+    } finally {
+      if (convertedPath) cleanupFile(convertedPath);
+      if (sourcePath) cleanupFile(sourcePath);
     }
   }
 );
@@ -416,67 +505,73 @@ server.tool(
 // TOOL: process_video
 server.tool(
   "process_video",
-  "Process a video file: extracts audio transcript via Whisper + keyframes as inline images Claude can see. Auto-cleans up all temp files after processing.",
+  "Process a bridge-managed video file: extracts audio transcript via Whisper + keyframes as inline images Claude can see. Auto-cleans up all temp files after processing.",
   {
-    filePath: z.string().describe("Absolute path to the video file"),
+    filePath: z.string().describe("Absolute path to a bridge-managed video file inside DOWNLOAD_DIR"),
     extractFrames: z.boolean().optional().describe("Whether to extract keyframes (default: true)"),
     maxFrames: z.number().optional().describe("Maximum number of keyframes to extract (default: 10)"),
   },
   async ({ filePath, extractFrames, maxFrames }) => {
-    if (!fs.existsSync(filePath)) return { content: [{ type: "text", text: `Error: File not found: ${filePath}` }] };
-
     const doFrames = extractFrames !== false;
-    const frameLimit = maxFrames || 10;
-    const results: Record<string, unknown> = { sourceFile: filePath };
+    const frameLimit = Math.min(Math.max(Math.trunc(maxFrames ?? 10), 1), 20);
+    let sourcePath: string | null = null;
+    try {
+      sourcePath = ensureManagedDownloadFilePath(filePath);
+    } catch (err: any) {
+      return { content: [{ type: "text", text: `Error: ${err.message}` }] };
+    }
+
+    const results: Record<string, unknown> = { sourceFile: sourcePath };
     let audioPath: string | null = null;
     let framesDir: string | null = null;
 
-    // Transcribe audio
     try {
-      audioPath = filePath.replace(/\.[^.]+$/, ".mp3");
-      execSync(`ffmpeg -y -i "${filePath}" -vn -acodec libmp3lame -q:a 2 "${audioPath}"`, { timeout: 120000, stdio: "pipe" });
-      results.transcript = await transcribeAudio(audioPath);
-    } catch (err: any) {
-      results.transcript = `[Audio extraction/transcription failed: ${err.message}]`;
-    }
-
-    // Extract keyframes
-    const content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> = [];
-    if (doFrames) {
+      // Transcribe audio
       try {
-        framesDir = path.join(DOWNLOAD_DIR, `frames_${Date.now()}`);
-        fs.mkdirSync(framesDir, { recursive: true });
-
-        let duration = 10;
-        try {
-          const probe = execSync(`ffprobe -v error -show_entries format=duration -of csv=p=0 "${filePath}"`, { timeout: 30000, stdio: "pipe" }).toString().trim();
-          duration = parseFloat(probe) || 10;
-        } catch {}
-
-        const interval = Math.max(duration / frameLimit, 2);
-        execSync(`ffmpeg -y -i "${filePath}" -vf "fps=1/${interval}" -frames:v ${frameLimit} "${framesDir}/frame_%03d.jpg"`, { timeout: 120000, stdio: "pipe" });
-
-        const frameFiles = fs.readdirSync(framesDir).sort().filter(f => f.endsWith(".jpg"));
-        results.keyframeCount = frameFiles.length;
-
-        for (const file of frameFiles) {
-          try {
-            const imgData = fs.readFileSync(path.join(framesDir, file));
-            content.push({ type: "image", data: imgData.toString("base64"), mimeType: "image/jpeg" });
-          } catch {}
-        }
+        audioPath = sourcePath.replace(/\.[^.]+$/, ".mp3");
+        runCommand("ffmpeg", ["-y", "-i", sourcePath, "-vn", "-acodec", "libmp3lame", "-q:a", "2", audioPath], 120000);
+        results.transcript = await transcribeAudio(audioPath);
       } catch (err: any) {
-        results.keyframeError = err.message;
+        results.transcript = `[Audio extraction/transcription failed: ${err.message}]`;
       }
+
+      // Extract keyframes
+      const content: Array<{ type: string; text?: string; data?: string; mimeType?: string }> = [];
+      if (doFrames) {
+        try {
+          framesDir = path.join(DOWNLOAD_ROOT, `frames_${Date.now()}`);
+          fs.mkdirSync(framesDir, { recursive: true, mode: 0o700 });
+
+          let duration = 10;
+          try {
+            const probe = runCommand("ffprobe", ["-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", sourcePath], 30000).trim();
+            duration = parseFloat(probe) || 10;
+          } catch {}
+
+          const interval = Math.max(duration / frameLimit, 2);
+          runCommand("ffmpeg", ["-y", "-i", sourcePath, "-vf", `fps=1/${interval}`, "-frames:v", String(frameLimit), path.join(framesDir, "frame_%03d.jpg")], 120000);
+
+          const frameFiles = fs.readdirSync(framesDir).sort().filter(f => f.endsWith(".jpg"));
+          results.keyframeCount = frameFiles.length;
+
+          for (const file of frameFiles) {
+            try {
+              const imgData = fs.readFileSync(path.join(framesDir, file));
+              content.push({ type: "image", data: imgData.toString("base64"), mimeType: "image/jpeg" });
+            } catch {}
+          }
+        } catch (err: any) {
+          results.keyframeError = err.message;
+        }
+      }
+
+      content.unshift({ type: "text", text: JSON.stringify(results) });
+      return { content: content as any };
+    } finally {
+      if (audioPath) cleanupFile(audioPath);
+      if (framesDir) cleanupDir(framesDir);
+      if (sourcePath) cleanupFile(sourcePath);
     }
-
-    // Auto-cleanup everything
-    if (audioPath) cleanupFile(audioPath);
-    if (framesDir) cleanupDir(framesDir);
-    cleanupFile(filePath);
-
-    content.unshift({ type: "text", text: JSON.stringify(results) });
-    return { content: content as any };
   }
 );
 

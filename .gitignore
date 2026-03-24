@@ -1,6 +1,7 @@
 node_modules/
 build/
 .env*
+!.env.example
 .claude/
 
 # Beads / Dolt files (added by bd init)

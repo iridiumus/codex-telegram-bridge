@@ -16,6 +16,7 @@ The official Claude Code Channels (Telegram plugin) only works in the CLI. This 
 - Photos returned as base64 images — Claude can see them inline
 - Send files with auto-type detection (images as photos, videos as video, everything else as documents)
 - `.ts` files automatically renamed to `.txt` (Telegram treats TypeScript as MPEG Transport Stream)
+- Downloaded media filenames are sanitized and kept inside a managed temp directory
 
 **Interactive**
 - Inline keyboard buttons — send choices, receive taps
@@ -33,6 +34,11 @@ The official Claude Code Channels (Telegram plugin) only works in the CLI. This 
 - Stop codewords: `/done`, `/stop`, `/back`, `/desk` — cleanly end the listening loop
 - `check_messages` for non-blocking queue reads
 - MCP logging notifications when messages arrive while not listening
+
+**Security**
+- `send_file` is limited to the current workspace, downloaded Telegram media, and any extra roots declared in `ALLOWED_FILE_ROOTS`
+- `transcribe_audio` and `process_video` only operate on files downloaded into `DOWNLOAD_DIR`
+- FFmpeg and FFprobe are invoked without shell interpolation
 
 ## Tools
 
@@ -88,6 +94,38 @@ Add to your `.mcp.json` (in your project root or `~/.claude/.mcp.json`):
   }
 }
 ```
+
+### 4a. Optional: Run in Docker Compose
+
+Copy `.env.example` to `.env`, fill in the Telegram values, and set `WORKSPACE_BIND` to the directory whose files Claude should be allowed to send to Telegram.
+
+```bash
+cp -f .env.example .env
+docker compose run --rm -T telegram-bridge
+```
+
+For Claude Code, the MCP command can call Docker directly:
+
+```json
+{
+  "mcpServers": {
+    "telegram": {
+      "command": "docker",
+      "args": [
+        "compose",
+        "-f",
+        "/path/to/claude-telegram-bridge/docker-compose.yml",
+        "run",
+        "--rm",
+        "-T",
+        "telegram-bridge"
+      ]
+    }
+  }
+}
+```
+
+The Compose service uses a read-only root filesystem, drops Linux capabilities, enables `no-new-privileges`, and stores downloads in a tmpfs-mounted `/tmp`.
 
 ### 5. Optional: Audio/Video processing
 
@@ -147,6 +185,7 @@ Send a video → Claude calls `process_video` → gets:
 | `CHAT_ID` | Yes | Your Telegram chat ID |
 | `OPENAI_API_KEY` | No | For audio transcription and video processing |
 | `DOWNLOAD_DIR` | No | Where to save media files (default: `/tmp/telegram-mcp`) |
+| `ALLOWED_FILE_ROOTS` | No | Extra comma-separated absolute paths that `send_file` may read from |
 
 ## How It Works
 
@@ -160,6 +199,7 @@ The bot runs inside the MCP server process. No separate service, no webhook setu
 - **VS Code keyboard blocked** while `wait_for_message` is active (you're on Telegram instead)
 - **No push notifications** — Claude can't initiate a turn from Telegram. You text first, Claude responds.
 - **Telegram file size limit** — 50MB for downloads, 10MB for photos
+- **Media-processing tools are scoped** — `transcribe_audio` and `process_video` only accept files under `DOWNLOAD_DIR`
 
 ## License
 
