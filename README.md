@@ -35,6 +35,12 @@ The official Claude Code Channels (Telegram plugin) only works in the CLI. This 
 - `check_messages` for non-blocking queue reads
 - MCP logging notifications when messages arrive while not listening
 
+**Planned: Multi-Agent Shared Chat** *(design only — not implemented yet)*
+- Multiple agents or subagents will be able to wait for replies at the same time in one shared Telegram chat
+- Users should reply to a specific bot message to target one waiting agent
+- A user message with no Telegram reply target will be treated as a broadcast and delivered to every agent currently waiting
+- Agent-authored messages will carry a compact header with name, role, and agent ID so users can see who asked what
+
 **Security**
 - `send_file` is limited to the current workspace, downloaded Telegram media, and any extra roots declared in `ALLOWED_FILE_ROOTS`
 - `transcribe_audio` and `process_video` only operate on files downloaded into `DOWNLOAD_DIR`
@@ -156,6 +162,51 @@ Claude will call `wait_for_message`, and you can text from your phone. Every mes
 
 Send `/done` to stop the loop and return to the VS Code keyboard.
 
+### Planned: Shared Chat Routing
+
+This section describes the intended multi-agent design. It is documentation for the next implementation step, not current runtime behavior.
+
+**User protocol**
+- When multiple agents are active, the user should always use Telegram's **Reply** action on the specific bot message they are answering
+- A reply to a specific bot message is a **direct reply** and should only wake the waiter attached to that message
+- A normal chat message with no reply target is a **broadcast reply** and should wake every agent currently waiting
+- If a user forgets to use Reply, the message is still accepted, but it is treated as shared input for all active waiters
+
+**Agent header format**
+
+Every outbound question should use a short, standardized first line:
+
+```text
+[Security Review | reviewer | sg-2]
+```
+
+Recommended field order:
+- `label` first, because humans scan the chat by topic or name
+- `role` second, because it explains why the agent is asking
+- `id` last, because it is mainly for disambiguation and debugging
+
+Example:
+
+```text
+[Security Review | reviewer | sg-2]
+
+Can you confirm whether this token is still valid?
+```
+
+**Reply routing rules**
+- Agent A sends a message and stores the returned Telegram `message_id`
+- Agent A then waits for either:
+  - a direct reply whose `reply_to_message_id` matches its own `message_id`
+  - a broadcast reply with no `reply_to_message_id`
+- Agent B can do the same at the same time with a different `message_id`
+- If the user replies directly to Agent A, Agent B keeps waiting
+- If the user sends a non-reply message, both Agent A and Agent B receive the same message and both waits resolve
+
+**Buttons and callbacks**
+- Inline button presses should follow the same routing rule as text
+- A callback on a bot message belongs to the waiter registered for that Telegram `message_id`
+- Button presses should not be broadcast unless they are attached to a deliberately shared prompt
+
 ### Inline Buttons
 
 ```
@@ -193,6 +244,99 @@ This is an MCP (Model Context Protocol) server that connects Claude Code to a Te
 
 The bot runs inside the MCP server process. No separate service, no webhook setup, no public URL needed. It starts when Claude Code loads the MCP config and stops when the session ends.
 
+## Planned Multi-Agent Design
+
+The current implementation is single-waiter only. It keeps one `waitingResolver`, one `callbackResolver`, and one shared queue. To support multiple agents in the same chat, the server should move to explicit waiter registration and reply routing.
+
+### 1. Replace single resolvers with a waiter registry
+
+Planned in-memory structures:
+- `pendingWaiters: Map<string, PendingWaiter>` keyed by a waiter token such as `agent_id:message_id`
+- `waitersByMessageId: Map<number, Set<string>>` so a Telegram reply can be routed by `reply_to_message.message_id`
+- `generalBacklog: RoutedEvent[]` for broadcast messages that arrive before any waiter consumes them
+- `targetedBacklog: Map<number, RoutedEvent[]>` for direct replies that arrive before the matching waiter starts waiting
+
+Each `PendingWaiter` should store:
+- `agent.id`
+- `agent.label`
+- `agent.role`
+- `target_message_id`
+- `resolve`
+- `created_at`
+- `allow_broadcast` with default `true`
+
+### 2. Add structured agent metadata to outbound messages
+
+Planned `send_message` extension:
+
+```json
+{
+  "message": "Question body",
+  "agent": {
+    "label": "Security Review",
+    "role": "reviewer",
+    "id": "sg-2"
+  }
+}
+```
+
+The MCP server should render the header itself instead of forcing every agent to hand-build it. That keeps formatting stable and makes routing metadata explicit.
+
+### 3. Add reply-scoped waiting
+
+Planned `wait_for_message` extension:
+
+```json
+{
+  "agent": {
+    "label": "Security Review",
+    "role": "reviewer",
+    "id": "sg-2"
+  },
+  "target_message_id": 12345,
+  "allow_broadcast": true
+}
+```
+
+Expected behavior:
+- If a targeted backlog item already exists for `target_message_id`, return it immediately
+- Else if a general backlog item exists and `allow_broadcast` is `true`, return that immediately
+- Else register the waiter and block
+
+`check_messages` should gain the same routing inputs for symmetry with `wait_for_message`.
+
+### 4. Route incoming Telegram messages by reply target
+
+Planned message routing:
+- If the incoming Telegram message has `reply_to_message.message_id`, deliver it only to waiters registered for that target message
+- If it has no reply target, deliver it to all currently waiting agents and mark the payload as `delivery: "broadcast"`
+- If no waiter is active, store the event in `generalBacklog` or `targetedBacklog` instead of dropping it
+
+Planned callback routing:
+- Use `callback_query.message.message_id` as the routing key
+- Deliver the callback only to waiters attached to that message
+
+### 5. Return routing metadata to agents
+
+Each delivered event should include enough context for the receiving agent to understand why it woke up. Planned additions to the payload:
+- `delivery`: `"direct"` or `"broadcast"`
+- `reply_to_message_id`: Telegram reply target when present
+- `message_id`: Telegram message ID of the incoming user message
+- `target_message_id`: the bot message this waiter was registered against
+- `agent`: the waiter metadata for the waking agent
+
+### 6. Preserve a compatibility path
+
+For a staged rollout, the MCP server should keep the current single-agent behavior when no `agent` metadata or `target_message_id` is provided. That allows existing callers to continue working while new multi-agent clients adopt the routed mode explicitly.
+
+### 7. Suggested rollout order
+
+1. Introduce shared routing data structures and direct-reply matching.
+2. Add server-rendered agent headers in `send_message`.
+3. Extend `wait_for_message` and `check_messages` with `target_message_id` and `agent` metadata.
+4. Route callback queries by `message_id`.
+5. Add tests for direct reply, broadcast reply, backlog replay, and concurrent waiters.
+
 ## Limitations
 
 - **One chat only** — the `CHAT_ID` env var locks it to a single conversation
@@ -200,6 +344,7 @@ The bot runs inside the MCP server process. No separate service, no webhook setu
 - **No push notifications** — Claude can't initiate a turn from Telegram. You text first, Claude responds.
 - **Telegram file size limit** — 50MB for downloads, 10MB for photos
 - **Media-processing tools are scoped** — `transcribe_audio` and `process_video` only accept files under `DOWNLOAD_DIR`
+- **Multi-agent shared routing is still planned** — the current runtime still resolves only one waiter at a time
 
 ## License
 
