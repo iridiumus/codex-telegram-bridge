@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "server",
+  "dolt_database": "codex_telegram_bridge",
+  "project_id": "ab6fa729-deec-4d90-94d0-137c203554cf"
+}
