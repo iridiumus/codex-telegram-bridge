@@ -64,7 +64,7 @@ Find `"chat":{"id":YOUR_CHAT_ID}` in the response.
 ### 3. Install
 
 ```bash
-git clone https://github.com/lordoftruth74/claude-telegram-bridge.git
+git clone https://github.com/carlosvianney/claude-telegram-bridge.git
 cd claude-telegram-bridge
 npm install
 npm run build
